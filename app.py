@@ -108,6 +108,26 @@ def api_shades():
 # ---------------------------------------------------------------------------
 
 
+def _robust_average_rgb(rgb_pixels: np.ndarray) -> np.ndarray:
+    """사진(또는 크롭한 영역) 안의 픽셀들에서 하이라이트(반사광으로 인한 밝은
+    부분)와 그림자(어두운 부분)를 자동으로 제외하고 평균 색상을 구해요.
+
+    방법: 각 픽셀의 밝기(luminance)를 계산해서, 밝기 기준 하위 15% / 상위
+    15%에 해당하는 픽셀(=그림자, 하이라이트일 가능성이 높은 픽셀)은 버리고
+    나머지(중간 밝기, 즉 대부분 고르게 조명된 '진짜' 색상 부분)만으로
+    평균을 내요. 남는 픽셀이 너무 적으면(사진이 아주 작거나 단색에 가까우면)
+    안전하게 전체 픽셀 평균으로 대신해요."""
+    rgb_pixels = rgb_pixels.reshape(-1, 3).astype(np.float64)
+    if len(rgb_pixels) == 0:
+        return np.zeros(3)
+    lum = rgb_pixels[:, 0] * 0.299 + rgb_pixels[:, 1] * 0.587 + rgb_pixels[:, 2] * 0.114
+    lo, hi = np.percentile(lum, [15, 85])
+    mask = (lum >= lo) & (lum <= hi)
+    if mask.sum() < max(10, len(rgb_pixels) * 0.05):
+        return np.mean(rgb_pixels, axis=0)
+    return np.mean(rgb_pixels[mask], axis=0)
+
+
 def _require_admin(x_admin_password: Optional[str]):
     expected = os.environ.get("ADMIN_PASSWORD")
     if not expected:
@@ -132,10 +152,17 @@ async def admin_add_shade(
     files: List[UploadFile] = File(...),
     x_admin_password: Optional[str] = Header(None),
 ):
-    """사진(최대 5장) + 각 사진에서 선택한 크롭 영역으로 색상을 측정해서
-    새 파운데이션 색상을 저장해요. use_card=True 면 사진마다 색상카드를 찾아
-    카메라/조명 보정을 거치고, False 면 크롭 영역의 색을 보정 없이 그대로 써요.
-    여러 장이면 평균을 내요 (원래 Streamlit 버전과 동일한 방식)."""
+    """사진(최대 5장)으로 색상을 측정해서 새 파운데이션 색상을 저장해요.
+
+    use_card=True 면 사진마다 색상카드를 찾아 카메라/조명 보정을 거치고,
+    False 면 보정 없이 그대로 써요. 여러 장이면 평균을 내요 (원래 Streamlit
+    버전과 동일한 방식).
+
+    crops의 각 항목은 {x,y,w,h} 또는 null이에요. null이면(주로 "이미지에서
+    색상만 추출" 방식처럼 이미 원하는 부분만 잘라서 올린 사진일 때) 크롭
+    없이 사진 전체를 그대로 사용해요. 어느 쪽이든 실제 평균 색상은
+    _robust_average_rgb()가 하이라이트(반사광)/그림자에 해당하는 픽셀을
+    자동으로 제외하고 계산해요."""
     _require_admin(x_admin_password)
 
     try:
@@ -157,19 +184,24 @@ async def admin_add_shade(
             continue
 
         h_img, w_img = bgr.shape[:2]
-        x = max(0, min(int(box.get("x", 0)), w_img - 1))
-        y = max(0, min(int(box.get("y", 0)), h_img - 1))
-        w = max(1, min(int(box.get("w", 1)), w_img - x))
-        h = max(1, min(int(box.get("h", 1)), h_img - y))
-        crop_rgb = cv2.cvtColor(bgr[y : y + h, x : x + w], cv2.COLOR_BGR2RGB)
-        median_rgb = np.median(crop_rgb.reshape(-1, 3), axis=0)
+        if box is None:
+            # 크롭 지정 없음 -> 사진 전체를 그대로 사용해요.
+            crop_bgr = bgr
+        else:
+            x = max(0, min(int(box.get("x", 0)), w_img - 1))
+            y = max(0, min(int(box.get("y", 0)), h_img - 1))
+            w = max(1, min(int(box.get("w", 1)), w_img - x))
+            h = max(1, min(int(box.get("h", 1)), h_img - y))
+            crop_bgr = bgr[y : y + h, x : x + w]
+        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        avg_rgb = _robust_average_rgb(crop_rgb)
 
         if use_card:
             calib = calibrate_from_image(bgr)
             if not calib.success:
                 photo_debug.append({"file": f.filename, "error": f"색상카드 인식 실패: {calib.message}"})
                 continue
-            corrected_rgb = apply_correction(median_rgb, calib.correction_matrix)
+            corrected_rgb = apply_correction(avg_rgb, calib.correction_matrix)
             lab = rgb_to_lab(corrected_rgb)
             photo_debug.append(
                 {
@@ -179,7 +211,7 @@ async def admin_add_shade(
                 }
             )
         else:
-            lab = rgb_to_lab(median_rgb)
+            lab = rgb_to_lab(avg_rgb)
             photo_debug.append({"file": f.filename, "lab": [round(float(v), 2) for v in lab]})
 
         labs.append(lab)
