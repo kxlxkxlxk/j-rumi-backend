@@ -99,6 +99,10 @@ class SkinRegionSample:
     center: tuple
     radius: int
     n_pixels_used: int
+    n_pixels_total: int = 0          # 원 안에 들어온 전체 픽셀 수
+    clip_pct: float = 15.0           # 밝기 상·하위 몇 %를 제외했는지
+    lum_low: float = 0.0             # 이 밝기보다 어두우면 제외(그림자 쪽)
+    lum_high: float = 0.0            # 이 밝기보다 밝으면 제외(빛 반사 쪽)
 
 
 @dataclass
@@ -107,6 +111,7 @@ class SkinSampleResult:
     message: str = ""
     regions: list = field(default_factory=list)  # list[SkinRegionSample]
     interpupillary_dist: float = None
+    image_size: tuple = None  # (width, height) -- 화면에 영역을 그릴 때 비율 계산용
 
 
 def _landmark_px(landmarks, idx, w, h):
@@ -119,7 +124,10 @@ def _sample_region(rgb_img: np.ndarray, center, radius: int, clip_pct: float = 1
     and darkest `clip_pct` percent of pixels by luminance (removes
     specular-highlight and shadow pixels rather than blending them into
     the average). Returns (median_rgb, n_pixels_kept) or None if the ROI
-    falls outside the image."""
+    falls outside the image.
+
+    NOTE: 결과 화면에서 "어떻게 걸러냈는지"를 보여주기 위해 전체 픽셀 수와
+    제외 기준 밝기값(lo/hi)도 함께 돌려줘요."""
     h, w = rgb_img.shape[:2]
     cx, cy = int(center[0]), int(center[1])
     if not (0 <= cx < w and 0 <= cy < h):
@@ -137,7 +145,7 @@ def _sample_region(rgb_img: np.ndarray, center, radius: int, clip_pct: float = 1
     kept = pixels[keep] if np.any(keep) else pixels
 
     median_rgb = np.median(kept, axis=0)
-    return median_rgb, int(kept.shape[0])
+    return median_rgb, int(kept.shape[0]), int(pixels.shape[0]), float(lo), float(hi), float(clip_pct)
 
 
 def extract_skin_regions(bgr_img: np.ndarray, radius_factor: float = 0.10) -> SkinSampleResult:
@@ -169,7 +177,7 @@ def extract_skin_regions(bgr_img: np.ndarray, radius_factor: float = 0.10) -> Sk
         sampled = _sample_region(rgb, center, radius)
         if sampled is None:
             continue
-        median_rgb, n_used = sampled
+        median_rgb, n_used, n_total, lum_lo, lum_hi, clip_pct = sampled
         regions.append(
             SkinRegionSample(
                 name=name,
@@ -177,6 +185,10 @@ def extract_skin_regions(bgr_img: np.ndarray, radius_factor: float = 0.10) -> Sk
                 center=(int(center[0]), int(center[1])),
                 radius=radius,
                 n_pixels_used=n_used,
+                n_pixels_total=n_total,
+                clip_pct=clip_pct,
+                lum_low=round(lum_lo, 1),
+                lum_high=round(lum_hi, 1),
             )
         )
 
@@ -187,5 +199,6 @@ def extract_skin_regions(bgr_img: np.ndarray, radius_factor: float = 0.10) -> Sk
         )
 
     return SkinSampleResult(
-        True, "피부색 샘플 추출 완료", regions=regions, interpupillary_dist=interpupillary_dist
+        True, "피부색 샘플 추출 완료", regions=regions, interpupillary_dist=interpupillary_dist,
+        image_size=(int(w), int(h)),
     )

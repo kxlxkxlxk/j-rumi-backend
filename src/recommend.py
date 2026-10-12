@@ -143,6 +143,11 @@ def recommend_foundation(
                 "lab": [round(float(x), 2) for x in lab],
                 "center": region.center,
                 "radius": region.radius,
+                "n_pixels_total": region.n_pixels_total,
+                "n_pixels_used": region.n_pixels_used,
+                "clip_pct": region.clip_pct,
+                "lum_low": region.lum_low,
+                "lum_high": region.lum_high,
             }
         )
 
@@ -163,6 +168,7 @@ def recommend_foundation(
         debug={
             "regions": region_debug,
             "final_region": skin.regions[medoid_idx].name,
+            "image_size": list(skin.image_size) if skin.image_size else None,
             "has_card": has_card,
             "calibration_mean_error": calib.mean_delta_e if calib is not None else None,
             "correction_matrix": calib.correction_matrix.tolist() if calib is not None else None,
