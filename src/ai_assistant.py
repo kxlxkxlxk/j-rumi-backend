@@ -269,3 +269,42 @@ def chat(question, history, skin_lab, matches) -> dict:
         return {"text": text, "source": "ai", "reason": None}
     except AIUnavailable as e:
         return {"text": fallback_chat(question, skin_lab, matches), "source": "fallback", "reason": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# 연결 점검용 (주소창에서 열어 보는 용도, 키 값은 절대 보여주지 않아요)
+# ---------------------------------------------------------------------------
+def diagnose() -> dict:
+    api_key = os.environ.get("GEMINI_API_KEY") or ""
+    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    out = {
+        "key_set": bool(api_key.strip()),
+        "key_length": len(api_key),
+        "key_starts_with": api_key[:3] if api_key else "",
+        "key_has_extra_space": api_key != api_key.strip(),
+        "model": model,
+    }
+    if not api_key:
+        out["result"] = "GEMINI_API_KEY가 서버에 없어요. 저장 후 Redeploy를 했는지 확인하세요."
+        return out
+    try:
+        resp = requests.post(
+            GEMINI_ENDPOINT.format(model=model),
+            headers={"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"},
+            json={"contents": [{"role": "user", "parts": [{"text": "안녕이라고만 답해줘"}]}],
+                  "generationConfig": {"maxOutputTokens": 20}},
+            timeout=AI_TIMEOUT_SEC,
+        )
+        out["google_http_status"] = resp.status_code
+        if resp.status_code == 200:
+            out["result"] = "성공! Gemini가 정상 응답했어요."
+        else:
+            try:
+                msg = resp.json().get("error", {}).get("message", "")
+            except Exception:
+                msg = resp.text[:200]
+            out["google_message"] = str(msg).replace(api_key, "***")[:300]
+            out["result"] = "구글이 요청을 거절했어요. google_message를 확인하세요."
+    except requests.RequestException as e:
+        out["result"] = f"구글 서버에 연결하지 못했어요 ({type(e).__name__})"
+    return out

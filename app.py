@@ -22,17 +22,15 @@ from typing import List, Optional
 
 import numpy as np
 import cv2
-from fastapi import Body, FastAPI, Header, HTTPException, Request, UploadFile, File, Form
+from fastapi import Body, FastAPI, Header, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
 
 from src.calibration import apply_correction, calibrate_from_image, capture_card_reference
 from src.color_match import rgb_to_lab
 from src.recommend import recommend_foundation
 from src import github_storage
 from src import reference_colors
-from src import ai_assistant
 
 app = FastAPI()
 
@@ -348,58 +346,6 @@ async def api_recommend(
                 "traceback": traceback.format_exc(),
             },
         )
-
-
-# ---------------------------------------------------------------------------
-# AI 설명 / 상담 (Gemini 무료 API) -- 사진은 보내지 않고 측정 수치만 사용해요.
-# 제품 정보는 클라이언트가 보낸 값이 아니라 서버가 DB에서 직접 찾아요.
-# ---------------------------------------------------------------------------
-class AiExplainRequest(BaseModel):
-    skin_lab: List[float] = Field(..., min_length=3, max_length=3)
-    match_ids: List[str] = Field(..., min_length=1, max_length=5)
-
-
-class AiChatTurn(BaseModel):
-    role: str
-    text: str = Field("", max_length=1000)
-
-
-class AiChatRequest(AiExplainRequest):
-    question: str = Field(..., max_length=300)
-    history: List[AiChatTurn] = Field(default_factory=list, max_length=12)
-
-
-def _client_id(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown"))
-
-
-def _prepare_ai_context(req: AiExplainRequest):
-    shades, _source = load_shades()
-    matches = ai_assistant.build_matches(req.skin_lab, req.match_ids, shades)
-    return matches
-
-
-@app.post("/api/ai/explain")
-async def api_ai_explain(req: AiExplainRequest, request: Request):
-    if ai_assistant.rate_limited(_client_id(request)):
-        return JSONResponse(status_code=429, content={"success": False, "message": "요청이 너무 많아요. 잠시 후 다시 시도해주세요."})
-    matches = _prepare_ai_context(req)
-    if not matches:
-        return JSONResponse(status_code=400, content={"success": False, "message": "추천 제품 정보를 찾지 못했어요"})
-    result = ai_assistant.explain(req.skin_lab, matches)
-    return {"success": True, **result}
-
-
-@app.post("/api/ai/chat")
-async def api_ai_chat(req: AiChatRequest, request: Request):
-    if ai_assistant.rate_limited(_client_id(request)):
-        return JSONResponse(status_code=429, content={"success": False, "message": "요청이 너무 많아요. 잠시 후 다시 시도해주세요."})
-    matches = _prepare_ai_context(req)
-    if not matches:
-        return JSONResponse(status_code=400, content={"success": False, "message": "추천 제품 정보를 찾지 못했어요"})
-    result = ai_assistant.chat(req.question, [t.model_dump() for t in req.history], req.skin_lab, matches)
-    return {"success": True, **result}
 
 
 # ---------------------------------------------------------------------------
