@@ -632,7 +632,9 @@ def apply_correction_image(rgb_img: np.ndarray, M: np.ndarray) -> np.ndarray:
 # "technically correct" (but visually stronger) correction for matching
 # the reference app's subtler look; turning it down or up is just editing
 # this one constant.
-CORRECTION_STRENGTH = 0.3
+# [2026-10 변경] 0.3 -> 0.12: 카드가 밝게 찍힌 사진에서 피부가 너무 어둡고 붉게(칙칙하게) 나와서,
+# 보정을 약 12%만 적용하도록 낮췄어요. (0.0 = 보정 안 함, 1.0 = 카드 기준 그대로)
+CORRECTION_STRENGTH = 0.12
 
 
 def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
@@ -646,6 +648,9 @@ def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):
         return CalibrationResult(False, f"카드 안 색상 패치를 충분히 찾지 못했어요 ({len(boxes)}/24개 인식)")
 
     observed_rgb = np.array([_sample_patch_color(warped, b) for b in boxes])
+    if not np.all(np.isfinite(observed_rgb)):
+        # 카드 가장자리 때문에 비어 있는 칸이 생기면 NaN이 나와서 계산이 터졌어요 -> 이 후보는 건너뛰어요.
+        return CalibrationResult(False, "카드 칸 색을 읽지 못한 후보예요")
     active_reference = get_active_reference_rgb_list()
     row_ind, col_ind, _cost = match_patches_to_reference(observed_rgb, active_reference)
 
@@ -752,21 +757,13 @@ def capture_card_reference(bgr_img: np.ndarray):
 MAX_ACCEPTABLE_MEAN_ERROR = 55.0
 
 
-def calibrate_from_image(bgr_img: np.ndarray) -> CalibrationResult:
-    """Automatically find and calibrate against the ColorChecker card.
-
-    Rather than trusting a single "most likely" card-shaped region, this
-    tries every plausible candidate region from `_candidate_quads` and
-    keeps whichever one actually matches the card's known reference
-    colors best -- since the 24 reference colors are fixed and known in
-    advance, "how well do this region's colors match them" is a much
-    stronger and more specific test than any purely geometric guess, and
-    is what lets this stay fully automatic even when hair, clothing
-    patterns, or jewelry are right next to the card in the photo.
-    """
-    candidates = _candidate_quads(bgr_img)
+def _best_over_candidates(bgr_img: np.ndarray, finder_img: np.ndarray):
+    """finder_img에서 카드 후보 위치를 찾고, 각 후보를 bgr_img(원본)로 보정해서 가장 잘 맞는 결과를 돌려줘요.
+    (finder_img는 원본과 크기가 같고, 밝기만 다를 수 있어요 -- 위치는 그대로 쓸 수 있어요.)
+    후보 하나가 계산 중 에러를 내도 다음 후보로 넘어가요."""
+    candidates = _candidate_quads(finder_img)
     if not candidates:
-        return CalibrationResult(False, "카드를 사진에서 찾지 못했어요 (색상카드가 잘 보이게 다시 촬영해주세요)")
+        return None, 0
 
     h, w = bgr_img.shape[:2]
     dedupe_radius = 0.03 * max(h, w)
@@ -788,17 +785,59 @@ def calibrate_from_image(bgr_img: np.ndarray) -> CalibrationResult:
             continue
         tried.append((center, diag))
 
-        result = _try_calibrate_candidate(bgr_img, quad)
+        try:
+            result = _try_calibrate_candidate(bgr_img, quad)
+        except Exception:
+            continue
         if not result.success:
             continue
         if best is None or result.mean_delta_e < best.mean_delta_e:
             best = result
+    return best, len(tried)
+
+
+# 카드 위치를 못 찾았을 때, 사진을 이 정도로 어둡게 만든 복사본으로 위치만 다시 찾아봐요.
+# (너무 밝게 찍혀서 카드의 밝은 색 칸이 하얗게 날아간 사진도 어둡게 하면 색 칸이 살아나요.)
+# 색 보정 계산 자체는 항상 원본 사진으로 해요.
+_DARKEN_FALLBACK_GAMMAS = (1.3, 1.6, 2.0)
+
+
+def _darken(bgr_img: np.ndarray, gamma: float) -> np.ndarray:
+    lut = np.array([255.0 * ((i / 255.0) ** gamma) for i in range(256)]).clip(0, 255).astype(np.uint8)
+    return cv2.LUT(bgr_img, lut)
+
+
+def calibrate_from_image(bgr_img: np.ndarray) -> CalibrationResult:
+    """Automatically find and calibrate against the ColorChecker card.
+
+    Rather than trusting a single "most likely" card-shaped region, this
+    tries every plausible candidate region from `_candidate_quads` and
+    keeps whichever one actually matches the card's known reference
+    colors best -- since the 24 reference colors are fixed and known in
+    advance, "how well do this region's colors match them" is a much
+    stronger and more specific test than any purely geometric guess, and
+    is what lets this stay fully automatic even when hair, clothing
+    patterns, or jewelry are right next to the card in the photo.
+
+    카드를 못 찾으면(주로 사진이 너무 밝아 색 칸이 날아간 경우) 어둡게 만든 복사본으로
+    위치만 다시 찾아본 뒤, 보정은 원본으로 해요. 먼저 성공한 사진의 결과는 예전과 같아요.
+    """
+    best, n_tried = _best_over_candidates(bgr_img, bgr_img)
+
+    if best is None or best.mean_delta_e > MAX_ACCEPTABLE_MEAN_ERROR:
+        for g in _DARKEN_FALLBACK_GAMMAS:
+            alt, n_alt = _best_over_candidates(bgr_img, _darken(bgr_img, g))
+            n_tried += n_alt
+            if alt is not None and (best is None or alt.mean_delta_e < best.mean_delta_e):
+                best = alt
+            if best is not None and best.mean_delta_e <= MAX_ACCEPTABLE_MEAN_ERROR:
+                break
 
     if best is None or best.mean_delta_e > MAX_ACCEPTABLE_MEAN_ERROR:
         return CalibrationResult(
             False,
-            "카드를 사진에서 찾지 못했어요 (색상카드가 잘 보이게, 너무 어둡지 않은 곳에서 다시 촬영해주세요)",
+            "카드를 사진에서 찾지 못했어요 (색상카드가 잘 보이게, 너무 밝거나 어둡지 않은 곳에서 다시 촬영해주세요)",
         )
 
-    best.n_candidates_tried = len(tried)
+    best.n_candidates_tried = n_tried
     return best
