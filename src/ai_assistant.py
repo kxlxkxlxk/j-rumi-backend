@@ -163,41 +163,73 @@ class AIUnavailable(Exception):
     pass
 
 
+# 구글 무료 모델은 사람이 몰리면 "지금 수요가 많아요(503)"라며 잠깐씩 거절해요.
+# 그럴 땐 비슷한 다른 모델로 바로 넘어가요. (처음 모델은 GEMINI_MODEL 환경변수, 없으면 gemini-flash-latest)
+_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite")
+_RETRY_STATUS = (404, 429, 500, 502, 503, 504)  # 모델 문제로 보고 다음 모델을 시도할 상태 코드
+_PER_CALL_TIMEOUT_SEC = 10
+
+
+def _model_chain() -> list:
+    first = (os.environ.get("GEMINI_MODEL") or "gemini-flash-latest").strip()
+    extra = [m.strip() for m in (os.environ.get("GEMINI_FALLBACK_MODELS") or "").split(",") if m.strip()]
+    chain = []
+    for m in [first] + (extra or list(_FALLBACK_MODELS)):
+        if m not in chain:
+            chain.append(m)
+    return chain
+
+
+def _post_gemini(api_key: str, model: str, body: dict):
+    return requests.post(
+        GEMINI_ENDPOINT.format(model=model),
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+        json=body,
+        timeout=_PER_CALL_TIMEOUT_SEC,
+    )
+
+
 def _call_gemini(contents: list) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
         raise AIUnavailable("GEMINI_API_KEY 환경변수가 설정되지 않았어요")
-    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     body = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": contents,
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048},
     }
-    try:
-        resp = requests.post(
-            GEMINI_ENDPOINT.format(model=model),
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=body,
-            timeout=AI_TIMEOUT_SEC,
-        )
-    except requests.RequestException as e:
-        raise AIUnavailable(f"AI 서버에 연결하지 못했어요 ({type(e).__name__})")
-    if resp.status_code == 429:
-        raise AIUnavailable("AI 무료 사용 한도에 도달했어요")
-    if resp.status_code != 200:
-        raise AIUnavailable(f"AI 응답 오류 (HTTP {resp.status_code})")
-    try:
-        data = resp.json()
-        cand = data["candidates"][0]
-        parts = cand["content"]["parts"]
-        text = "".join(p.get("text", "") for p in parts).strip()
-        finish = cand.get("finishReason", "")
-    except Exception:
-        raise AIUnavailable("AI 응답을 해석하지 못했어요")
-    text = _clean_text(text, truncated=(finish == "MAX_TOKENS"))
-    if not text:
-        raise AIUnavailable("AI가 빈 답변을 보냈어요")
-    return text
+    last_err = "AI 응답 오류"
+    for model in _model_chain():
+        try:
+            resp = _post_gemini(api_key, model, body)
+        except requests.RequestException as e:
+            last_err = f"AI 서버에 연결하지 못했어요 ({type(e).__name__})"
+            continue
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                cand = data["candidates"][0]
+                parts = cand["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts).strip()
+                finish = cand.get("finishReason", "")
+            except Exception:
+                last_err = "AI 응답을 해석하지 못했어요"
+                continue
+            text = _clean_text(text, truncated=(finish == "MAX_TOKENS"))
+            if text:
+                return text
+            last_err = "AI가 빈 답변을 보냈어요"
+            continue
+        if resp.status_code in (401, 403):
+            raise AIUnavailable(f"AI 키가 거절됐어요 (HTTP {resp.status_code})")
+        if resp.status_code in _RETRY_STATUS:
+            last_err = (
+                "AI 무료 사용 한도에 도달했어요" if resp.status_code == 429
+                else f"AI 서버가 지금 바빠요 (HTTP {resp.status_code})"
+            )
+            continue
+        last_err = f"AI 응답 오류 (HTTP {resp.status_code})"
+    raise AIUnavailable(last_err)
 
 
 def _clean_text(text: str, truncated: bool = False) -> str:
@@ -292,36 +324,41 @@ def chat(question, history, skin_lab, matches) -> dict:
 # 연결 점검용 (주소창에서 열어 보는 용도, 키 값은 절대 보여주지 않아요)
 # ---------------------------------------------------------------------------
 def diagnose() -> dict:
-    api_key = os.environ.get("GEMINI_API_KEY") or ""
-    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    api_key = (os.environ.get("GEMINI_API_KEY") or "")
+    raw = os.environ.get("GEMINI_API_KEY") or ""
     out = {
         "key_set": bool(api_key.strip()),
-        "key_length": len(api_key),
-        "key_starts_with": api_key[:3] if api_key else "",
-        "key_has_extra_space": api_key != api_key.strip(),
-        "model": model,
+        "key_length": len(raw),
+        "key_starts_with": raw[:3] if raw else "",
+        "key_has_extra_space": raw != raw.strip(),
+        "models_tried_in_order": _model_chain(),
     }
-    if not api_key:
+    if not api_key.strip():
         out["result"] = "GEMINI_API_KEY가 서버에 없어요. 저장 후 Redeploy를 했는지 확인하세요."
         return out
-    try:
-        resp = requests.post(
-            GEMINI_ENDPOINT.format(model=model),
-            headers={"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"},
-            json={"contents": [{"role": "user", "parts": [{"text": "안녕이라고만 답해줘"}]}],
-                  "generationConfig": {"maxOutputTokens": 20}},
-            timeout=AI_TIMEOUT_SEC,
-        )
-        out["google_http_status"] = resp.status_code
-        if resp.status_code == 200:
-            out["result"] = "성공! Gemini가 정상 응답했어요."
-        else:
-            try:
-                msg = resp.json().get("error", {}).get("message", "")
-            except Exception:
-                msg = resp.text[:200]
-            out["google_message"] = str(msg).replace(api_key, "***")[:300]
-            out["result"] = "구글이 요청을 거절했어요. google_message를 확인하세요."
-    except requests.RequestException as e:
-        out["result"] = f"구글 서버에 연결하지 못했어요 ({type(e).__name__})"
+    per_model = {}
+    ok_any = False
+    for model in _model_chain():
+        try:
+            resp = _post_gemini(
+                api_key.strip(), model,
+                {"contents": [{"role": "user", "parts": [{"text": "안녕이라고만 답해줘"}]}],
+                 "generationConfig": {"maxOutputTokens": 64}},
+            )
+            if resp.status_code == 200:
+                per_model[model] = "정상 (200)"
+                ok_any = True
+            else:
+                try:
+                    msg = resp.json().get("error", {}).get("message", "")
+                except Exception:
+                    msg = resp.text[:120]
+                per_model[model] = f"HTTP {resp.status_code}: " + str(msg).replace(api_key.strip(), "***")[:140]
+        except requests.RequestException as e:
+            per_model[model] = f"연결 실패 ({type(e).__name__})"
+    out["per_model"] = per_model
+    out["result"] = (
+        "성공! 적어도 한 모델이 정상 응답해요 (앱은 정상인 모델로 자동 전환해요)." if ok_any
+        else "모든 모델이 거절했어요. per_model의 메시지를 확인하세요."
+    )
     return out
