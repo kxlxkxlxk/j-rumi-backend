@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from src.calibration import apply_correction, calibrate_from_image, capture_card_reference
+from src.calibration import apply_correction, calibrate_from_image, capture_card_reference, correct_rgb
 from src.color_match import rgb_to_lab
 from src.recommend import recommend_foundation
 from src import github_storage
@@ -203,7 +203,7 @@ async def admin_add_shade(
             if not calib.success:
                 photo_debug.append({"file": f.filename, "error": f"색상카드 인식 실패: {calib.message}"})
                 continue
-            corrected_rgb = apply_correction(avg_rgb, calib.correction_matrix)
+            corrected_rgb = correct_rgb(avg_rgb, calib.correction_matrix)
             lab = rgb_to_lab(corrected_rgb)
             photo_debug.append(
                 {

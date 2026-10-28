@@ -632,9 +632,58 @@ def apply_correction_image(rgb_img: np.ndarray, M: np.ndarray) -> np.ndarray:
 # "technically correct" (but visually stronger) correction for matching
 # the reference app's subtler look; turning it down or up is just editing
 # this one constant.
-# [2026-10 변경] 0.3 -> 0.12: 카드가 밝게 찍힌 사진에서 피부가 너무 어둡고 붉게(칙칙하게) 나와서,
-# 보정을 약 12%만 적용하도록 낮췄어요. (0.0 = 보정 안 함, 1.0 = 카드 기준 그대로)
-CORRECTION_STRENGTH = 0.12
+# [2026-10 변경] 보정을 "색깔"과 "밝기" 두 가지로 나눠서 따로 강도를 정해요.
+#  - 색깔(CORRECTION_STRENGTH): 사진에 낀 푸른 기·붉은 기 같은 색 치우침을 얼마나 바로잡을지.
+#    약하게 하면(예: 0.12) 푸른 기가 남아서 피부가 회분홍색으로 탁해져요.
+#    카드의 피부색 계열 칸으로 검증해 보니 0.7~1.0 구간이 가장 정확했고, 그중 안전하게 0.7로 정했어요. (0.0 = 안 함, 1.0 = 카드 기준 그대로)
+#  - 밝기(BRIGHTNESS_CORRECTION_STRENGTH): 카드 기준으로 얼마나 밝게/어둡게 바꿀지.
+#    카드가 얼굴과 다른 빛을 받는 경우가 많아서, 크게 바꾸면 피부가 어둡고 칙칙해져요 -> 약하게(12%).
+CORRECTION_STRENGTH = 0.7
+BRIGHTNESS_CORRECTION_STRENGTH = 0.12
+
+
+def _lab_to_rgb255(lab) -> np.ndarray:
+    """CIELAB(D65) -> sRGB 0~255 (color_match.rgb2lab_01의 반대 방향)."""
+    L, a, b = [float(v) for v in lab]
+    fy = (L + 16.0) / 116.0
+    fx = fy + a / 500.0
+    fz = fy - b / 200.0
+    delta = 6.0 / 29.0
+
+    def finv(t):
+        return t ** 3 if t > delta else 3 * delta * delta * (t - 4.0 / 29.0)
+
+    xyz = np.array([0.95047 * finv(fx), 1.0 * finv(fy), 1.08883 * finv(fz)])
+    m_inv = np.linalg.inv(
+        np.array(
+            [
+                [0.4124564, 0.3575761, 0.1804375],
+                [0.2126729, 0.7151522, 0.0721750],
+                [0.0193339, 0.1191920, 0.9503041],
+            ]
+        )
+    )
+    lin = np.clip(m_inv @ xyz, 0.0, 1.0)
+    srgb = np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * np.power(lin, 1 / 2.4) - 0.055)
+    return np.clip(srgb * 255.0, 0, 255)
+
+
+def correct_rgb(raw_rgb, M: np.ndarray, brightness_strength: float = None) -> np.ndarray:
+    """카드 보정을 적용한 피부색(sRGB 0~255)을 돌려줘요.
+
+    - 색깔(a*, b*): 보정 행렬을 그대로 적용한 값을 써요 (푸른 기·붉은 기를 바로잡아요).
+    - 밝기(L*): 원래 사진 밝기에서 보정이 바꾸려는 만큼의 BRIGHTNESS_CORRECTION_STRENGTH 비율만 반영해요.
+      (카드가 얼굴과 다른 빛을 받으면 밝기 보정이 피부를 어둡고 탁하게 만들기 때문이에요.)
+    """
+    from .color_match import rgb_to_lab
+
+    k = BRIGHTNESS_CORRECTION_STRENGTH if brightness_strength is None else brightness_strength
+    raw = np.array(raw_rgb, dtype=np.float64)
+    corrected = apply_correction(raw, M)
+    lab_raw = rgb_to_lab(raw)
+    lab_cor = rgb_to_lab(corrected)
+    L = float(lab_raw[0] + k * (lab_cor[0] - lab_raw[0]))
+    return _lab_to_rgb255([L, lab_cor[1], lab_cor[2]])
 
 
 def _try_calibrate_candidate(bgr_img: np.ndarray, quad: np.ndarray):

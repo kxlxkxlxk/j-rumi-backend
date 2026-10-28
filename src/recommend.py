@@ -12,7 +12,7 @@ of the sampled regions is, by construction, the least shadow-affected.
 from dataclasses import dataclass, field
 import numpy as np
 
-from .calibration import calibrate_from_image
+from .calibration import calibrate_from_image, correct_rgb
 from .skin_extraction import extract_skin_regions
 from .color_match import rgb_to_lab, find_best_matches_meta, delta_e_ciede2000
 
@@ -130,7 +130,7 @@ def recommend_foundation(
     region_debug = []
     for region in skin.regions:
         if has_card:
-            corrected_rgb = np.clip(calib.correction_matrix @ np.append(region.raw_rgb, 1.0), 0, 255)
+            corrected_rgb = correct_rgb(region.raw_rgb, calib.correction_matrix)
         else:
             corrected_rgb = np.array(region.raw_rgb, dtype=np.float64)
         lab = rgb_to_lab(corrected_rgb)
@@ -201,7 +201,7 @@ def build_shade_from_photos(bgr_imgs: list, swatch_box_picker=None) -> dict:
             crop = img
         median_bgr = np.median(crop.reshape(-1, 3), axis=0)
         raw_rgb = median_bgr[::-1]
-        corrected_rgb = np.clip(calib.correction_matrix @ np.append(raw_rgb, 1.0), 0, 255)
+        corrected_rgb = correct_rgb(raw_rgb, calib.correction_matrix)
         labs.append(rgb_to_lab(corrected_rgb))
 
     if not labs:
